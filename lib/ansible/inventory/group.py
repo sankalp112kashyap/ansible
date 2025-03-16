@@ -30,26 +30,24 @@ display = Display()
 
 
 def to_safe_group_name(name, replacer="_", force=False, silent=False):
-    # Converts 'bad' characters in a string to underscores (or provided replacer) so they can be used as Ansible hosts or groups
+    if not name:
+        return name
+        
+    invalid_chars = C.INVALID_VARIABLE_NAMES.findall(name)
+    if not invalid_chars:
+        return name
 
-    warn = ''
-    if name:  # when deserializing we might not have name yet
-        invalid_chars = C.INVALID_VARIABLE_NAMES.findall(name)
-        if invalid_chars:
-            msg = 'invalid character(s) "%s" in group name (%s)' % (to_text(set(invalid_chars)), to_text(name))
-            if C.TRANSFORM_INVALID_GROUP_CHARS not in ('never', 'ignore') or force:
-                name = C.INVALID_VARIABLE_NAMES.sub(replacer, name)
-                if not (silent or C.TRANSFORM_INVALID_GROUP_CHARS == 'silently'):
-                    display.vvvv('Replacing ' + msg)
-                    warn = 'Invalid characters were found in group names and automatically replaced, use -vvvv to see details'
-            else:
-                if C.TRANSFORM_INVALID_GROUP_CHARS == 'never':
-                    display.vvvv('Not replacing %s' % msg)
-                    warn = 'Invalid characters were found in group names but not replaced, use -vvvv to see details'
-
-    if warn:
-        display.warning(warn)
-
+    msg = f'invalid character(s) "{set(invalid_chars)}" in group name ({name})'
+    if C.TRANSFORM_INVALID_GROUP_CHARS in ('never', 'ignore') and not force:
+        if C.TRANSFORM_INVALID_GROUP_CHARS == 'never':
+            display.vvvv(f'Not replacing {msg}')
+            display.warning('Invalid characters were found in group names but not replaced, use -vvvv to see details')
+        return name
+    
+    name = C.INVALID_VARIABLE_NAMES.sub(replacer, name)
+    if not (silent or C.TRANSFORM_INVALID_GROUP_CHARS == 'silently'):
+        display.vvvv('Replacing ' + msg)
+        display.warning('Invalid characters were found in group names and automatically replaced, use -vvvv to see details')
     return name
 
 
@@ -59,17 +57,12 @@ class InventoryObjectType(Enum):
 
 
 class Group:
-    """ a group of ansible hosts """
     base_type = InventoryObjectType.GROUP
 
-    # __slots__ = [ 'name', 'hosts', 'vars', 'child_groups', 'parent_groups', 'depth', '_hosts_cache' ]
-
     def __init__(self, name=None):
-
         self.depth = 0
         self.name = to_safe_group_name(name)
         self.hosts = []
-        self._hosts = None
         self.vars = {}
         self.child_groups = []
         self.parent_groups = []
@@ -89,74 +82,42 @@ class Group:
         return self.deserialize(data)
 
     def serialize(self):
-        parent_groups = []
-        for parent in self.parent_groups:
-            parent_groups.append(parent.serialize())
-
-        self._hosts = None
-
-        result = dict(
-            name=self.name,
-            vars=self.vars.copy(),
-            parent_groups=parent_groups,
-            depth=self.depth,
-            hosts=self.hosts,
-        )
-
-        return result
+        return {
+            'name': self.name,
+            'vars': self.vars.copy(),
+            'parent_groups': [parent.serialize() for parent in self.parent_groups],
+            'depth': self.depth,
+            'hosts': self.hosts
+        }
 
     def deserialize(self, data):
-        self.__init__()  # used by __setstate__ to deserialize in place  # pylint: disable=unnecessary-dunder-call
+        self.__init__()
         self.name = data.get('name')
-        self.vars = data.get('vars', dict())
+        self.vars = data.get('vars', {})
         self.depth = data.get('depth', 0)
         self.hosts = data.get('hosts', [])
-        self._hosts = None
-
-        parent_groups = data.get('parent_groups', [])
-        for parent_data in parent_groups:
+        
+        for parent_data in data.get('parent_groups', []):
             g = Group()
             g.deserialize(parent_data)
             self.parent_groups.append(g)
 
     def _walk_relationship(self, rel, include_self=False, preserve_ordering=False):
-        """
-        Given `rel` that is an iterable property of Group,
-        consitituting a directed acyclic graph among all groups,
-        Returns a set of all groups in full tree
-        A   B    C
-        |  / |  /
-        | /  | /
-        D -> E
-        |  /    vertical connections
-        | /     are directed upward
-        F
-        Called on F, returns set of (A, B, C, D, E)
-        """
-        seen = set([])
+        seen = set()
         unprocessed = set(getattr(self, rel))
         if include_self:
             unprocessed.add(self)
-        if preserve_ordering:
-            ordered = [self] if include_self else []
-            ordered.extend(getattr(self, rel))
+        ordered = [self] if include_self and preserve_ordering else []
+        ordered.extend(getattr(self, rel)) if preserve_ordering else None
 
         while unprocessed:
             seen.update(unprocessed)
-            new_unprocessed = set([])
+            new_items = set(chain.from_iterable(getattr(g, rel) for g in unprocessed))
+            unprocessed = new_items - seen
+            if preserve_ordering:
+                ordered.extend(item for item in new_items if item not in seen)
 
-            for new_item in chain.from_iterable(getattr(g, rel) for g in unprocessed):
-                new_unprocessed.add(new_item)
-                if preserve_ordering:
-                    if new_item not in seen:
-                        ordered.append(new_item)
-
-            new_unprocessed.difference_update(seen)
-            unprocessed = new_unprocessed
-
-        if preserve_ordering:
-            return ordered
-        return seen
+        return ordered if preserve_ordering else seen
 
     def get_ancestors(self):
         return self._walk_relationship('parent_groups')
@@ -166,9 +127,7 @@ class Group:
 
     @property
     def host_names(self):
-        if self._hosts is None:
-            self._hosts = set(self.hosts)
-        return self._hosts
+        return {host.name for host in self.hosts}
 
     def get_name(self):
         return self.name
@@ -178,10 +137,7 @@ class Group:
         if self == group:
             raise Exception("can't add group to itself")
 
-        # don't add if it's already there
         if group not in self.child_groups:
-
-            # prepare list of group's new ancestors this edge creates
             start_ancestors = group.get_ancestors()
             new_ancestors = self.get_ancestors()
             if group in new_ancestors:
@@ -192,14 +148,10 @@ class Group:
             added = True
             self.child_groups.append(group)
 
-            # update the depth of the child
             group.depth = max([self.depth + 1, group.depth])
 
-            # update the depth of the grandchildren
             group._check_children_depth()
 
-            # now add self to child's parent_groups list, but only if there
-            # isn't already a group with the same name
             if self.name not in [g.name for g in group.parent_groups]:
                 group.parent_groups.append(self)
                 for h in group.get_hosts():
@@ -211,7 +163,7 @@ class Group:
     def _check_children_depth(self):
 
         depth = self.depth
-        start_depth = self.depth  # self.depth could change over loop
+        start_depth = self.depth
         seen = set([])
         unprocessed = set(self.child_groups)
 
@@ -228,24 +180,20 @@ class Group:
                 raise AnsibleError("The group named '%s' has a recursive dependency loop." % to_native(self.name))
 
     def add_host(self, host):
-        added = False
         if host.name not in self.host_names:
             self.hosts.append(host)
-            self._hosts.add(host.name)
             host.add_group(self)
             self.clear_hosts_cache()
-            added = True
-        return added
+            return True
+        return False
 
     def remove_host(self, host):
-        removed = False
         if host.name in self.host_names:
             self.hosts.remove(host)
-            self._hosts.remove(host.name)
             host.remove_group(self)
             self.clear_hosts_cache()
-            removed = True
-        return removed
+            return True
+        return False
 
     def set_variable(self, key, value):
 
@@ -271,16 +219,14 @@ class Group:
 
     def _get_hosts(self):
 
-        hosts = []
         seen = {}
+        hosts = []
         for kid in self.get_descendants(include_self=True, preserve_ordering=True):
-            kid_hosts = kid.hosts
-            for kk in kid_hosts:
-                if kk not in seen:
-                    seen[kk] = 1
-                    if self.name == 'all' and kk.implicit:
-                        continue
-                    hosts.append(kk)
+            for host in kid.hosts:
+                if host not in seen:
+                    seen[host] = 1
+                    if not (self.name == 'all' and host.implicit):
+                        hosts.append(host)
         return hosts
 
     def get_vars(self):
@@ -290,5 +236,4 @@ class Group:
         try:
             self.priority = int(priority)
         except TypeError:
-            # FIXME: warn about invalid priority
             pass
