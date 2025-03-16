@@ -156,34 +156,53 @@ class Task(Base, Conditional, Taggable, CollectionSearch, Notifiable, Delegatabl
         #                    version="2.10", collection_name='ansible.builtin')
 
     def preprocess_data(self, ds):
-        """
-        tasks are especially complex arguments so need pre-processing.
-        keep it short.
-        """
-
         if not isinstance(ds, dict):
             raise AnsibleAssertionError('ds (%s) should be a dict but was a %s' % (ds, type(ds)))
 
-        # the new, cleaned datastructure, which will have legacy
-        # items reduced to a standard structure suitable for the
-        # attributes of the task class
         new_ds = AnsibleMapping()
         if isinstance(ds, AnsibleBaseYAMLObject):
             new_ds.ansible_pos = ds.ansible_pos
 
-        # since this affects the task action parsing, we have to resolve in preprocess instead of in typical validator
-        default_collection = AnsibleCollectionConfig.default_collection
+        collections_list = self._process_collections(ds)
+        args_parser = ModuleArgsParser(task_ds=ds, collection_list=collections_list)
+        
+        try:
+            action, args, delegate_to = args_parser.parse()
+        except AnsibleParserError as e:
+            raise AnsibleParserError(to_native(e), obj=ds if not e.obj else None, orig_exc=e)
 
-        collections_list = ds.get('collections')
-        if collections_list is None:
-            # use the parent value if our ds doesn't define it
-            collections_list = self.collections
-        else:
-            # Validate this untemplated field early on to guarantee we are dealing with a list.
-            # This is also done in CollectionSearch._load_collections() but this runs before that call.
+        self.resolved_action = args_parser.resolved_action
+        
+        if action in C._ACTION_HAS_CMD and 'cmd' in args:
+            if args.get('_raw_params', ''):
+                raise AnsibleError("The 'cmd' argument cannot be used when other raw parameters are specified.")
+            args['_raw_params'] = args.pop('cmd')
+
+        new_ds.update({
+            'action': action,
+            'args': args,
+            'delegate_to': delegate_to,
+            'vars': self._load_vars(None, ds.get('vars', {}))
+        })
+
+        for k, v in ds.items():
+            if k in ('action', 'local_action', 'args', 'delegate_to') or k == action or k == 'shell':
+                continue
+            if k.startswith('with_') and k.removeprefix("with_") in lookup_loader:
+                self._preprocess_with_loop(ds, new_ds, k, v)
+            elif C.INVALID_TASK_ATTRIBUTE_FAILED or k in self.fattributes:
+                new_ds[k] = v
+            else:
+                display.warning(f"Ignoring invalid attribute: {k}")
+
+        return super(Task, self).preprocess_data(new_ds)
+
+    def _process_collections(self, ds):
+        collections_list = ds.get('collections', self.collections)
+        if collections_list is not None:
             collections_list = self.get_validated_value('collections', self.fattributes.get('collections'), collections_list, None)
-
-        if default_collection and not self._role:  # FIXME: and not a collections role
+            
+        if (default_collection := AnsibleCollectionConfig.default_collection) and not self._role:
             if collections_list:
                 if default_collection not in collections_list:
                     collections_list.insert(0, default_collection)
@@ -192,64 +211,11 @@ class Task(Base, Conditional, Taggable, CollectionSearch, Notifiable, Delegatabl
 
         if collections_list and 'ansible.builtin' not in collections_list and 'ansible.legacy' not in collections_list:
             collections_list.append('ansible.legacy')
-
+            
         if collections_list:
             ds['collections'] = collections_list
-
-        # use the args parsing class to determine the action, args,
-        # and the delegate_to value from the various possible forms
-        # supported as legacy
-        args_parser = ModuleArgsParser(task_ds=ds, collection_list=collections_list)
-        try:
-            (action, args, delegate_to) = args_parser.parse()
-        except AnsibleParserError as e:
-            # if the raises exception was created with obj=ds args, then it includes the detail
-            # so we dont need to add it so we can just re raise.
-            if e.obj:
-                raise
-            # But if it wasn't, we can add the yaml object now to get more detail
-            raise AnsibleParserError(to_native(e), obj=ds, orig_exc=e)
-        else:
-            # Set the resolved action plugin (or if it does not exist, module) for callbacks.
-            self.resolved_action = args_parser.resolved_action
-
-        # the command/shell/script modules used to support the `cmd` arg,
-        # which corresponds to what we now call _raw_params, so move that
-        # value over to _raw_params (assuming it is empty)
-        if action in C._ACTION_HAS_CMD:
-            if 'cmd' in args:
-                if args.get('_raw_params', '') != '':
-                    raise AnsibleError("The 'cmd' argument cannot be used when other raw parameters are specified."
-                                       " Please put everything in one or the other place.", obj=ds)
-                args['_raw_params'] = args.pop('cmd')
-
-        new_ds['action'] = action
-        new_ds['args'] = args
-        new_ds['delegate_to'] = delegate_to
-
-        # we handle any 'vars' specified in the ds here, as we may
-        # be adding things to them below (special handling for includes).
-        # When that deprecated feature is removed, this can be too.
-        if 'vars' in ds:
-            # _load_vars is defined in Base, and is used to load a dictionary
-            # or list of dictionaries in a standard way
-            new_ds['vars'] = self._load_vars(None, ds.get('vars'))
-        else:
-            new_ds['vars'] = dict()
-
-        for (k, v) in ds.items():
-            if k in ('action', 'local_action', 'args', 'delegate_to') or k == action or k == 'shell':
-                # we don't want to re-assign these values, which were determined by the ModuleArgsParser() above
-                continue
-            elif k.startswith('with_') and k.removeprefix("with_") in lookup_loader:
-                # transform into loop property
-                self._preprocess_with_loop(ds, new_ds, k, v)
-            elif C.INVALID_TASK_ATTRIBUTE_FAILED or k in self.fattributes:
-                new_ds[k] = v
-            else:
-                display.warning("Ignoring invalid attribute: %s" % k)
-
-        return super(Task, self).preprocess_data(new_ds)
+        
+        return collections_list
 
     def _load_loop_control(self, attr, ds):
         if not isinstance(ds, dict):
@@ -302,43 +268,34 @@ class Task(Base, Conditional, Taggable, CollectionSearch, Notifiable, Delegatabl
         return value
 
     def _post_validate_environment(self, attr, value, templar):
-        """
-        Override post validation of vars on the play, as we don't want to
-        template these too early.
-        """
+        if not value:
+            return {}
+            
         env = {}
-        if value is not None:
+        def _parse_env_kv(k, v):
+            try:
+                env[k] = templar.template(v, convert_bare=False)
+            except AnsibleUndefinedVariable as e:
+                if self.action in C._ACTION_FACT_GATHERING and ('ansible_facts.env' in str(e) or 'ansible_env' in str(e)):
+                    return
+                raise
 
-            def _parse_env_kv(k, v):
-                try:
-                    env[k] = templar.template(v, convert_bare=False)
-                except AnsibleUndefinedVariable as e:
-                    error = to_native(e)
-                    if self.action in C._ACTION_FACT_GATHERING and 'ansible_facts.env' in error or 'ansible_env' in error:
-                        # ignore as fact gathering is required for 'env' facts
-                        return
-                    raise
-
-            if isinstance(value, list):
-                for env_item in value:
-                    if isinstance(env_item, dict):
-                        for k in env_item:
-                            _parse_env_kv(k, env_item[k])
+        if isinstance(value, list):
+            for item in value:
+                if isinstance(item, dict):
+                    for k, v in item.items():
+                        _parse_env_kv(k, v)
+                else:
+                    isdict = templar.template(item, convert_bare=False)
+                    if isinstance(isdict, dict):
+                        env.update(isdict)
                     else:
-                        isdict = templar.template(env_item, convert_bare=False)
-                        if isinstance(isdict, dict):
-                            env |= isdict
-                        else:
-                            display.warning("could not parse environment value, skipping: %s" % value)
-
-            elif isinstance(value, dict):
-                # should not really happen
-                env = dict()
-                for env_item in value:
-                    _parse_env_kv(env_item, value[env_item])
-            else:
-                # at this point it should be a simple string, also should not happen
-                env = templar.template(value, convert_bare=False)
+                        display.warning(f"could not parse environment value, skipping: {value}")
+        elif isinstance(value, dict):
+            for k, v in value.items():
+                _parse_env_kv(k, v)
+        else:
+            env = templar.template(value, convert_bare=False)
 
         return env
 
