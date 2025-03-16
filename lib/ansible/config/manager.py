@@ -64,132 +64,61 @@ def _get_entry(plugin_type, plugin_name, config):
     return entry
 
 
-# FIXME: see if we can unify in module_utils with similar function used by argspec
 def ensure_type(value, value_type, origin=None, origin_ftype=None):
-    """ return a configuration variable with casting
-    :arg value: The value to ensure correct typing of
-    :kwarg value_type: The type of the value.  This can be any of the following strings:
-        :boolean: sets the value to a True or False value
-        :bool: Same as 'boolean'
-        :integer: Sets the value to an integer or raises a ValueType error
-        :int: Same as 'integer'
-        :float: Sets the value to a float or raises a ValueType error
-        :list: Treats the value as a comma separated list.  Split the value
-            and return it as a python list.
-        :none: Sets the value to None
-        :path: Expands any environment variables and tilde's in the value.
-        :tmppath: Create a unique temporary directory inside of the directory
-            specified by value and return its path.
-        :temppath: Same as 'tmppath'
-        :tmp: Same as 'tmppath'
-        :pathlist: Treat the value as a typical PATH string.  (On POSIX, this
-            means comma separated strings.)  Split the value and then expand
-            each part for environment variables and tildes.
-        :pathspec: Treat the value as a PATH string. Expands any environment variables
-            tildes's in the value.
-        :str: Sets the value to string types.
-        :string: Same as 'str'
-    """
+    """Return a configuration variable with correct typing"""
+    if value is None or not value_type:
+        return to_text(value, errors='surrogate_or_strict', nonstring='passthru')
 
-    errmsg = ''
-    basedir = None
-    if origin and os.path.isabs(origin) and os.path.exists(to_bytes(origin)):
-        basedir = origin
+    value_type = value_type.lower()
+    basedir = origin if origin and os.path.isabs(origin) and os.path.exists(to_bytes(origin)) else None
 
-    if value_type:
-        value_type = value_type.lower()
-
-    if value is not None:
+    try:
         if value_type in ('boolean', 'bool'):
-            value = boolean(value, strict=False)
-
+            return boolean(value, strict=False)
         elif value_type in ('integer', 'int'):
-            if not isinstance(value, int):
-                try:
-                    if (decimal_value := decimal.Decimal(value)) == (int_part := int(decimal_value)):
-                        value = int_part
-                    else:
-                        errmsg = 'int'
-                except decimal.DecimalException as e:
-                    raise ValueError from e
-
+            if isinstance(value, int):
+                return value
+            decimal_value = decimal.Decimal(value)
+            int_part = int(decimal_value)
+            return int_part if decimal_value == int_part else None
         elif value_type == 'float':
-            if not isinstance(value, float):
-                value = float(value)
-
+            return float(value) if not isinstance(value, float) else value
         elif value_type == 'list':
-            if isinstance(value, string_types):
-                value = [unquote(x.strip()) for x in value.split(',')]
-            elif not isinstance(value, Sequence):
-                errmsg = 'list'
-
+            return [unquote(x.strip()) for x in value.split(',')] if isinstance(value, string_types) else value
         elif value_type == 'none':
-            if value == "None":
-                value = None
-
-            if value is not None:
-                errmsg = 'None'
-
+            return None if value == "None" else value
         elif value_type == 'path':
-            if isinstance(value, string_types):
-                value = resolve_path(value, basedir=basedir)
-            else:
-                errmsg = 'path'
-
+            return resolve_path(value, basedir=basedir) if isinstance(value, string_types) else value
         elif value_type in ('tmp', 'temppath', 'tmppath'):
             if isinstance(value, string_types):
-                value = resolve_path(value, basedir=basedir)
-                if not os.path.exists(value):
-                    makedirs_safe(value, 0o700)
-                prefix = 'ansible-local-%s' % os.getpid()
-                value = tempfile.mkdtemp(prefix=prefix, dir=value)
-                atexit.register(cleanup_tmp_file, value, warn=True)
-            else:
-                errmsg = 'temppath'
-
-        elif value_type == 'pathspec':
+                path = resolve_path(value, basedir=basedir)
+                if not os.path.exists(path):
+                    makedirs_safe(path, 0o700)
+                tmp_path = tempfile.mkdtemp(prefix=f'ansible-local-{os.getpid()}', dir=path)
+                atexit.register(cleanup_tmp_file, tmp_path, warn=True)
+                return tmp_path
+        elif value_type in ('pathspec', 'pathlist'):
             if isinstance(value, string_types):
-                value = value.split(os.pathsep)
-
-            if isinstance(value, Sequence):
-                value = [resolve_path(x, basedir=basedir) for x in value]
-            else:
-                errmsg = 'pathspec'
-
-        elif value_type == 'pathlist':
-            if isinstance(value, string_types):
-                value = [x.strip() for x in value.split(',')]
-
-            if isinstance(value, Sequence):
-                value = [resolve_path(x, basedir=basedir) for x in value]
-            else:
-                errmsg = 'pathlist'
-
-        elif value_type in ('dict', 'dictionary'):
-            if not isinstance(value, Mapping):
-                errmsg = 'dictionary'
-
-        elif value_type in ('str', 'string'):
+                paths = value.split(os.pathsep if value_type == 'pathspec' else ',')
+                return [resolve_path(x.strip(), basedir=basedir) for x in paths]
+            return [resolve_path(x, basedir=basedir) for x in value] if isinstance(value, Sequence) else value
+        elif value_type in ('str', 'string', 'dict', 'dictionary'):
             if isinstance(value, (string_types, AnsibleVaultEncryptedUnicode, bool, int, float, complex)):
-                value = to_text(value, errors='surrogate_or_strict')
-                if origin_ftype and origin_ftype == 'ini':
-                    value = unquote(value)
-            else:
-                errmsg = 'string'
+                text_value = to_text(value, errors='surrogate_or_strict')
+                return unquote(text_value) if origin_ftype == 'ini' else text_value
+            return value if value_type in ('dict', 'dictionary') else None
+        
+        # Default string handling
+        if isinstance(value, (string_types, AnsibleVaultEncryptedUnicode)):
+            text_value = to_text(value, errors='surrogate_or_strict')
+            return unquote(text_value) if origin_ftype == 'ini' else text_value
+        
+        return value
 
-        # defaults to string type
-        elif isinstance(value, (string_types, AnsibleVaultEncryptedUnicode)):
-            value = to_text(value, errors='surrogate_or_strict')
-            if origin_ftype and origin_ftype == 'ini':
-                value = unquote(value)
-
-        if errmsg:
-            raise ValueError(f'Invalid type provided for "{errmsg}": {value!r}')
-
-    return to_text(value, errors='surrogate_or_strict', nonstring='passthru')
+    except (ValueError, decimal.DecimalException) as e:
+        raise ValueError(f'Invalid type provided for "{value_type}": {value!r}') from e
 
 
-# FIXME: see if this can live in utils/path
 def resolve_path(path, basedir=None):
     """ resolve relative or 'variable' paths """
     if '{{CWD}}' in path:  # allow users to force CWD using 'magic' {{CWD}}
@@ -198,7 +127,6 @@ def resolve_path(path, basedir=None):
     return unfrackpath(path, follow=False, basedir=basedir)
 
 
-# FIXME: generic file type?
 def get_config_type(cfile):
 
     ftype = None
@@ -214,7 +142,6 @@ def get_config_type(cfile):
     return ftype
 
 
-# FIXME: can move to module_utils for use for ini plugins also?
 def get_ini_config_value(p, entry):
     """ returns the value of last ini entry found """
     value = None
@@ -485,30 +412,20 @@ class ConfigManager(object):
         return ret
 
     def _loop_entries(self, container, entry_list):
-        """ repeat code for value entry assignment """
-
-        value = None
-        origin = None
+        """Process config entries and handle deprecation"""
         for entry in entry_list:
             name = entry.get('name')
             try:
-                temp_value = container.get(name, None)
+                value = container.get(name)
+                if value is not None:
+                    if isinstance(value, AnsibleVaultEncryptedUnicode):
+                        value = to_text(value, errors='surrogate_or_strict')
+                    if 'deprecated' in entry:
+                        self.DEPRECATED.append((entry['name'], entry['deprecated']))
+                    return value, name
             except UnicodeEncodeError:
-                self.WARNINGS.add(u'value for config entry {0} contains invalid characters, ignoring...'.format(to_text(name)))
-                continue
-            if temp_value is not None:  # only set if entry is defined in container
-                # inline vault variables should be converted to a text string
-                if isinstance(temp_value, AnsibleVaultEncryptedUnicode):
-                    temp_value = to_text(temp_value, errors='surrogate_or_strict')
-
-                value = temp_value
-                origin = name
-
-                # deal with deprecation of setting source, if used
-                if 'deprecated' in entry:
-                    self.DEPRECATED.append((entry['name'], entry['deprecated']))
-
-        return value, origin
+                self.WARNINGS.add(f'value for config entry {to_text(name)} contains invalid characters, ignoring...')
+        return None, None
 
     def get_config_value(self, config, cfile=None, plugin_type=None, plugin_name=None, keys=None, variables=None, direct=None):
         """ wrapper """
@@ -523,155 +440,62 @@ class ConfigManager(object):
         return value
 
     def get_config_value_and_origin(self, config, cfile=None, plugin_type=None, plugin_name=None, keys=None, variables=None, direct=None):
-        """ Given a config key figure out the actual value and report on the origin of the settings """
-        if cfile is None:
-            # use default config
-            cfile = self._config_file
-
+        """Get configuration value and its origin with optimized logic"""
         if config == 'CONFIG_FILE':
-            return cfile, ''
+            return self._config_file if cfile is None else cfile, ''
 
-        # Note: sources that are lists listed in low to high precedence (last one wins)
+        defs = self.get_configuration_definitions(plugin_type=plugin_type, name=plugin_name)
+        if config not in defs:
+            raise AnsibleError(f'Requested entry ({_get_entry(plugin_type, plugin_name, config)}) was not defined in configuration.')
+
         value = None
         origin = None
         origin_ftype = None
+        config_def = defs[config]
+        
+        # Process sources in order of precedence
+        sources = [
+            ('direct', lambda: (direct.get(config) if config in direct else next((direct[alias] for alias in config_def.get('aliases', []) if alias in direct), None), 'Direct')),
+            ('vars', lambda: self._loop_entries(variables, config_def.get('vars', [])) if variables and config_def.get('vars') else (None, None)),
+            ('keyword', lambda: self._loop_entries(keys, config_def.get('keyword', [])) if keys and config_def.get('keyword') else (None, None)),
+            ('cli', lambda: self._loop_entries(context.CLIARGS, config_def.get('cli', [])) if 'cli' in config_def else (None, None)),
+            ('env', lambda: self._loop_entries(os.environ, config_def.get('env', [])) if config_def.get('env') else (None, None)),
+        ]
 
-        defs = self.get_configuration_definitions(plugin_type=plugin_type, name=plugin_name)
-        if config in defs:
-
-            aliases = defs[config].get('aliases', [])
-
-            # direct setting via plugin arguments, can set to None so we bypass rest of processing/defaults
-            if direct:
-                if config in direct:
-                    value = direct[config]
-                    origin = 'Direct'
-                else:
-                    direct_aliases = [direct[alias] for alias in aliases if alias in direct]
-                    if direct_aliases:
-                        value = direct_aliases[0]
-                        origin = 'Direct'
-
-            if value is None and variables and defs[config].get('vars'):
-                # Use 'variable overrides' if present, highest precedence, but only present when querying running play
-                value, origin = self._loop_entries(variables, defs[config]['vars'])
-                origin = 'var: %s' % origin
-
-            # use playbook keywords if you have em
-            if value is None and defs[config].get('keyword') and keys:
-                value, origin = self._loop_entries(keys, defs[config]['keyword'])
-                origin = 'keyword: %s' % origin
-
-            # automap to keywords
-            # TODO: deprecate these in favor of explicit keyword above
-            if value is None and keys:
-                if config in keys:
-                    value = keys[config]
-                    keyword = config
-
-                elif aliases:
-                    for alias in aliases:
-                        if alias in keys:
-                            value = keys[alias]
-                            keyword = alias
-                            break
-
-                if value is not None:
-                    origin = 'keyword: %s' % keyword
-
-            if value is None and 'cli' in defs[config]:
-                # avoid circular import .. until valid
-                from ansible import context
-                value, origin = self._loop_entries(context.CLIARGS, defs[config]['cli'])
-                origin = 'cli: %s' % origin
-
-            # env vars are next precedence
-            if value is None and defs[config].get('env'):
-                value, origin = self._loop_entries(os.environ, defs[config]['env'])
-                origin = 'env: %s' % origin
-
-            # try config file entries next, if we have one
-            if self._parsers.get(cfile, None) is None:
-                self._parse_config_file(cfile)
-
-            # attempt to read from config file
-            if value is None and cfile is not None:
-                ftype = get_config_type(cfile)
-                if ftype and defs[config].get(ftype):
-                    try:
-                        for entry in defs[config][ftype]:
-                            # load from config
-                            if ftype == 'ini':
-                                temp_value = get_ini_config_value(self._parsers[cfile], entry)
-                            elif ftype == 'yaml':
-                                raise AnsibleError('YAML configuration type has not been implemented yet')
-                            else:
-                                raise AnsibleError('Invalid configuration file type: %s' % ftype)
-
-                            if temp_value is not None:
-                                # set value and origin
-                                value = temp_value
-                                origin = cfile
-                                origin_ftype = ftype
-                                if 'deprecated' in entry:
-                                    if ftype == 'ini':
-                                        self.DEPRECATED.append(('[%s]%s' % (entry['section'], entry['key']), entry['deprecated']))
-                                    else:
-                                        raise AnsibleError('Unimplemented file type: %s' % ftype)
-
-                    except Exception as e:
-                        sys.stderr.write("Error while loading config %s: %s" % (cfile, to_native(e)))
-
-            # set default if we got here w/o a value
+        for source_type, get_value in sources:
             if value is None:
-                if defs[config].get('required', False):
-                    if not plugin_type or config not in INTERNAL_DEFS.get(plugin_type, {}):
-                        raise AnsibleRequiredOptionError("No setting was provided for required configuration %s" %
-                                                         to_native(_get_entry(plugin_type, plugin_name, config)))
-                else:
-                    origin = 'default'
-                    value = self.template_default(defs[config].get('default'), variables)
-            try:
-                # ensure correct type, can raise exceptions on mismatched types
-                value = ensure_type(value, defs[config].get('type'), origin=origin, origin_ftype=origin_ftype)
-            except ValueError as e:
-                if origin.startswith('env:') and value == '':
-                    # this is empty env var for non string so we can set to default
-                    origin = 'default'
-                    value = ensure_type(defs[config].get('default'), defs[config].get('type'), origin=origin, origin_ftype=origin_ftype)
-                else:
-                    raise AnsibleOptionsError('Invalid type for configuration option %s (from %s): %s' %
-                                              (to_native(_get_entry(plugin_type, plugin_name, config)).strip(), origin, to_native(e)))
+                value, src = get_value()
+                if value is not None:
+                    origin = f'{source_type}: {src}' if src else source_type
 
-            # deal with restricted values
-            if value is not None and 'choices' in defs[config] and defs[config]['choices'] is not None:
-                invalid_choices = True  # assume the worst!
-                if defs[config].get('type') == 'list':
-                    # for a list type, compare all values in type are allowed
-                    invalid_choices = not all(choice in defs[config]['choices'] for choice in value)
-                else:
-                    # these should be only the simple data types (string, int, bool, float, etc) .. ignore dicts for now
-                    invalid_choices = value not in defs[config]['choices']
+        # Handle config file if value still not found
+        if value is None and cfile is not None:
+            if self._parsers.get(cfile) is None:
+                self._parse_config_file(cfile)
+            
+            ftype = get_config_type(cfile)
+            if ftype and config_def.get(ftype):
+                value, origin, origin_ftype = self._get_value_from_config_file(cfile, config_def[ftype], ftype)
 
-                if invalid_choices:
+        # Use default if no value found
+        if value is None:
+            if config_def.get('required', False) and (not plugin_type or config not in INTERNAL_DEFS.get(plugin_type, {})):
+                raise AnsibleRequiredOptionError(f"No setting was provided for required configuration {_get_entry(plugin_type, plugin_name, config)}")
+            value = self.template_default(config_def.get('default'), variables)
+            origin = 'default'
 
-                    if isinstance(defs[config]['choices'], Mapping):
-                        valid = ', '.join([to_text(k) for k in defs[config]['choices'].keys()])
-                    elif isinstance(defs[config]['choices'], string_types):
-                        valid = defs[config]['choices']
-                    elif isinstance(defs[config]['choices'], Sequence):
-                        valid = ', '.join([to_text(c) for c in defs[config]['choices']])
-                    else:
-                        valid = defs[config]['choices']
+        # Validate type and choices
+        try:
+            value = ensure_type(value, config_def.get('type'), origin, origin_ftype)
+            self._validate_choices(value, config_def, config, plugin_type, plugin_name)
+        except ValueError as e:
+            if origin.startswith('env:') and value == '':
+                value = ensure_type(config_def.get('default'), config_def.get('type'), 'default', origin_ftype)
+            else:
+                raise AnsibleOptionsError(f'Invalid type for configuration option {_get_entry(plugin_type, plugin_name, config)} (from {origin}): {e}')
 
-                    raise AnsibleOptionsError('Invalid value "%s" for configuration option "%s", valid values are: %s' %
-                                              (value, to_native(_get_entry(plugin_type, plugin_name, config)), valid))
-
-            # deal with deprecation of the setting
-            if 'deprecated' in defs[config] and origin != 'default':
-                self.DEPRECATED.append((config, defs[config].get('deprecated')))
-        else:
-            raise AnsibleError('Requested entry (%s) was not defined in configuration.' % to_native(_get_entry(plugin_type, plugin_name, config)))
+        if 'deprecated' in config_def and origin != 'default':
+            self.DEPRECATED.append((config, config_def.get('deprecated')))
 
         return value, origin
 
