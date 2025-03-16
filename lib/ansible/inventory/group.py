@@ -28,30 +28,35 @@ from ansible.utils.vars import combine_vars
 
 display = Display()
 
+
 def to_safe_group_name(name, replacer="_", force=False, silent=False):
-    warn = ''
-    if name:
-        invalid_chars = C.INVALID_VARIABLE_NAMES.findall(name)
-        if invalid_chars:
-            msg = 'invalid character(s) "%s" in group name (%s)' % (to_text(set(invalid_chars)), to_text(name))
-            if C.TRANSFORM_INVALID_GROUP_CHARS not in ('never', 'ignore') or force:
-                name = C.INVALID_VARIABLE_NAMES.sub(replacer, name)
-                if not (silent or C.TRANSFORM_INVALID_GROUP_CHARS == 'silently'):
-                    display.vvvv('Replacing ' + msg)
-                    warn = 'Invalid characters were found in group names and automatically replaced, use -vvvv to see details'
-            else:
-                if C.TRANSFORM_INVALID_GROUP_CHARS == 'never':
-                    display.vvvv('Not replacing %s' % msg)
-                    warn = 'Invalid characters were found in group names but not replaced, use -vvvv to see details'
-    if warn:
-        display.warning(warn)
+    # Converts 'bad' characters in a string to underscores (or provided replacer) so they can be used as Ansible hosts or groups
+
+    if not name:
+        return name
+
+    invalid_chars = C.INVALID_VARIABLE_NAMES.findall(name)
+    if invalid_chars:
+        msg = 'invalid character(s) "%s" in group name (%s)' % (to_text(set(invalid_chars)), to_text(name))
+        if C.TRANSFORM_INVALID_GROUP_CHARS not in ('never', 'ignore') or force:
+            name = C.INVALID_VARIABLE_NAMES.sub(replacer, name)
+            if not (silent or C.TRANSFORM_INVALID_GROUP_CHARS == 'silently'):
+                display.vvvv('Replacing ' + msg)
+                display.warning('Invalid characters were found in group names and automatically replaced, use -vvvv to see details')
+        elif C.TRANSFORM_INVALID_GROUP_CHARS == 'never':
+            display.vvvv('Not replacing %s' % msg)
+            display.warning('Invalid characters were found in group names but not replaced, use -vvvv to see details')
+
     return name
+
 
 class InventoryObjectType(Enum):
     HOST = 0
     GROUP = 1
 
+
 class Group:
+    """ a group of ansible hosts """
     base_type = InventoryObjectType.GROUP
 
     def __init__(self, name=None):
@@ -80,41 +85,56 @@ class Group:
     def serialize(self):
         parent_groups = [parent.serialize() for parent in self.parent_groups]
         self._hosts = None
-        return dict(
-            name=self.name,
-            vars=self.vars.copy(),
-            parent_groups=parent_groups,
-            depth=self.depth,
-            hosts=self.hosts,
-        )
+        return {
+            'name': self.name,
+            'vars': self.vars.copy(),
+            'parent_groups': parent_groups,
+            'depth': self.depth,
+            'hosts': self.hosts,
+        }
 
     def deserialize(self, data):
-        self.__init__()
+        self.__init__()  # used by __setstate__ to deserialize in place  # pylint: disable=unnecessary-dunder-call
         self.name = data.get('name')
         self.vars = data.get('vars', {})
         self.depth = data.get('depth', 0)
         self.hosts = data.get('hosts', [])
         self._hosts = None
-        for parent_data in data.get('parent_groups', []):
+
+        parent_groups = data.get('parent_groups', [])
+        for parent_data in parent_groups:
             g = Group()
             g.deserialize(parent_data)
             self.parent_groups.append(g)
 
     def _walk_relationship(self, rel, include_self=False, preserve_ordering=False):
+        """
+        Given `rel` that is an iterable property of Group,
+        consitituting a directed acyclic graph among all groups,
+        Returns a set of all groups in full tree
+        A   B    C
+        |  / |  /
+        | /  | /
+        D -> E
+        |  /    vertical connections
+        | /     are directed upward
+        F
+        Called on F, returns set of (A, B, C, D, E)
+        """
         seen = set()
         unprocessed = set(getattr(self, rel))
         if include_self:
             unprocessed.add(self)
-        if preserve_ordering:
-            ordered = [self] if include_self else []
-            ordered.extend(getattr(self, rel))
+        ordered = [self] if include_self else []
+        ordered.extend(getattr(self, rel))
+
         while unprocessed:
             seen.update(unprocessed)
             new_unprocessed = set(chain.from_iterable(getattr(g, rel) for g in unprocessed))
             if preserve_ordering:
                 ordered.extend(new_unprocessed - seen)
-            new_unprocessed.difference_update(seen)
-            unprocessed = new_unprocessed
+            unprocessed = new_unprocessed - seen
+
         return ordered if preserve_ordering else seen
 
     def get_ancestors(self):
@@ -135,6 +155,7 @@ class Group:
     def add_child_group(self, group):
         if self == group:
             raise Exception("can't add group to itself")
+
         if group not in self.child_groups:
             start_ancestors = group.get_ancestors()
             new_ancestors = self.get_ancestors()
@@ -142,13 +163,16 @@ class Group:
                 raise AnsibleError("Adding group '%s' as child to '%s' creates a recursive dependency loop." % (to_native(group.name), to_native(self.name)))
             new_ancestors.add(self)
             new_ancestors.difference_update(start_ancestors)
+
             self.child_groups.append(group)
             group.depth = max(self.depth + 1, group.depth)
             group._check_children_depth()
+
             if self.name not in [g.name for g in group.parent_groups]:
                 group.parent_groups.append(self)
                 for h in group.get_hosts():
                     h.populate_ancestors(additions=new_ancestors)
+
             self.clear_hosts_cache()
             return True
         return False
@@ -157,6 +181,7 @@ class Group:
         depth = self.depth
         seen = set()
         unprocessed = set(self.child_groups)
+
         while unprocessed:
             seen.update(unprocessed)
             depth += 1
@@ -208,11 +233,11 @@ class Group:
 
     def _get_hosts(self):
         hosts = []
-        seen = {}
+        seen = set()
         for kid in self.get_descendants(include_self=True, preserve_ordering=True):
             for kk in kid.hosts:
                 if kk not in seen:
-                    seen[kk] = 1
+                    seen.add(kk)
                     if self.name == 'all' and kk.implicit:
                         continue
                     hosts.append(kk)
