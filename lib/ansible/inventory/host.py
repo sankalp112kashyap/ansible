@@ -31,18 +31,14 @@ class Host:
     """ a single ansible host """
     base_type = InventoryObjectType.HOST
 
-    # __slots__ = [ 'name', 'vars', 'groups' ]
-
     def __getstate__(self):
         return self.serialize()
 
     def __setstate__(self, data):
-        return self.deserialize(data)
+        self.deserialize(data)
 
     def __eq__(self, other):
-        if not isinstance(other, Host):
-            return False
-        return self._uuid == other._uuid
+        return isinstance(other, Host) and self._uuid == other._uuid
 
     def __ne__(self, other):
         return not self.__eq__(other)
@@ -57,71 +53,47 @@ class Host:
         return self.get_name()
 
     def serialize(self):
-        groups = []
-        for group in self.groups:
-            groups.append(group.serialize())
-
         return dict(
             name=self.name,
             vars=self.vars.copy(),
             address=self.address,
             uuid=self._uuid,
-            groups=groups,
+            groups=[group.serialize() for group in self.groups],
             implicit=self.implicit,
         )
 
     def deserialize(self, data):
         self.__init__(gen_uuid=False)  # used by __setstate__ to deserialize in place  # pylint: disable=unnecessary-dunder-call
-
         self.name = data.get('name')
-        self.vars = data.get('vars', dict())
+        self.vars = data.get('vars', {})
         self.address = data.get('address', '')
-        self._uuid = data.get('uuid', None)
+        self._uuid = data.get('uuid')
         self.implicit = data.get('implicit', False)
-
-        groups = data.get('groups', [])
-        for group_data in groups:
-            g = Group()
-            g.deserialize(group_data)
-            self.groups.append(g)
+        self.groups = [Group().deserialize(group_data) for group_data in data.get('groups', [])]
 
     def __init__(self, name=None, port=None, gen_uuid=True):
-
         self.vars = {}
         self.groups = []
-        self._uuid = None
-
-        self.name = name
-        self.address = name
-
+        self._uuid = get_unique_id() if gen_uuid else None
+        self.name = self.address = name
         if port:
             self.set_variable('ansible_port', int(port))
-
-        if gen_uuid:
-            self._uuid = get_unique_id()
         self.implicit = False
 
     def get_name(self):
         return self.name
 
     def populate_ancestors(self, additions=None):
-        # populate ancestors
-        if additions is None:
-            for group in self.groups:
-                self.add_group(group)
-        else:
-            for group in additions:
-                if group not in self.groups:
-                    self.groups.append(group)
+        groups_to_add = additions if additions is not None else self.groups
+        for group in groups_to_add:
+            if group not in self.groups:
+                self.groups.append(group)
 
     def add_group(self, group):
         added = False
-        # populate ancestors first
         for oldg in group.get_ancestors():
             if oldg not in self.groups:
                 self.groups.append(oldg)
-
-        # actually add group
         if group not in self.groups:
             self.groups.append(group)
             added = True
@@ -132,15 +104,9 @@ class Host:
         if group in self.groups:
             self.groups.remove(group)
             removed = True
-
-            # remove exclusive ancestors, xcept all!
             for oldg in group.get_ancestors():
-                if oldg.name != 'all':
-                    for childg in self.groups:
-                        if oldg in childg.get_ancestors():
-                            break
-                    else:
-                        self.remove_group(oldg)
+                if oldg.name != 'all' and not any(oldg in childg.get_ancestors() for childg in self.groups):
+                    self.remove_group(oldg)
         return removed
 
     def set_variable(self, key, value):
@@ -153,15 +119,11 @@ class Host:
         return self.groups
 
     def get_magic_vars(self):
-        results = {}
-        results['inventory_hostname'] = self.name
-        if patterns['ipv4'].match(self.name) or patterns['ipv6'].match(self.name):
-            results['inventory_hostname_short'] = self.name
-        else:
-            results['inventory_hostname_short'] = self.name.split('.')[0]
-
-        results['group_names'] = sorted([g.name for g in self.get_groups() if g.name != 'all'])
-
+        results = {
+            'inventory_hostname': self.name,
+            'inventory_hostname_short': self.name if patterns['ipv4'].match(self.name) or patterns['ipv6'].match(self.name) else self.name.split('.')[0],
+            'group_names': sorted(g.name for g in self.get_groups() if g.name != 'all')
+        }
         return results
 
     def get_vars(self):
