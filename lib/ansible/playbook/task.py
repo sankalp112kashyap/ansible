@@ -33,39 +33,60 @@ from ansible.playbook.conditional import Conditional
 from ansible.playbook.delegatable import Delegatable
 from ansible.playbook.loop_control import LoopControl
 from ansible.playbook.notifiable import Notifiable
+from ansible.playbook.role import Role
 from ansible.playbook.taggable import Taggable
 from ansible.utils.collection_loader import AnsibleCollectionConfig
 from ansible.utils.display import Display
+
 from ansible.utils.vars import isidentifier
 
 __all__ = ['Task']
 
 display = Display()
 
+
 class Task(Base, Conditional, Taggable, CollectionSearch, Notifiable, Delegatable):
 
-    # Core task attributes
+    """
+    A task is a language feature that represents a call to a module, with given arguments and other parameters.
+    A handler is a subclass of a task.
+
+    Usage:
+
+       Task.load(datastructure) -> Task
+       Task.something(...)
+    """
+
+    # =================================================================================
+    # ATTRIBUTES
+    # load_<attribute_name> and
+    # validate_<attribute_name>
+    # will be used if defined
+    # might be possible to define others
+
+    # NOTE: ONLY set defaults on task attributes that are not inheritable,
+    # inheritance is only triggered if the 'current value' is Sentinel,
+    # default can be set at play/top level object and inheritance will take it's course.
+
     args = NonInheritableFieldAttribute(isa='dict', default=dict)
     action = NonInheritableFieldAttribute(isa='string')
-    
-    # Task execution attributes
+
     async_val = NonInheritableFieldAttribute(isa='int', default=0, alias='async')
-    delay = NonInheritableFieldAttribute(isa='float', default=5)
-    poll = NonInheritableFieldAttribute(isa='int', default=C.DEFAULT_POLL_INTERVAL)
-    register = NonInheritableFieldAttribute(isa='string', static=True)
-    retries = NonInheritableFieldAttribute(isa='int')
-
-    # Conditional attributes  
     changed_when = NonInheritableFieldAttribute(isa='list', default=list)
+    delay = NonInheritableFieldAttribute(isa='float', default=5)
     failed_when = NonInheritableFieldAttribute(isa='list', default=list)
-    until = NonInheritableFieldAttribute(isa='list', default=list)
-
-    # Loop attributes
     loop = NonInheritableFieldAttribute(isa='list')
     loop_control = NonInheritableFieldAttribute(isa='class', class_type=LoopControl, default=LoopControl)
+    poll = NonInheritableFieldAttribute(isa='int', default=C.DEFAULT_POLL_INTERVAL)
+    register = NonInheritableFieldAttribute(isa='string', static=True)
+    retries = NonInheritableFieldAttribute(isa='int')  # default is set in TaskExecutor
+    until = NonInheritableFieldAttribute(isa='list', default=list)
+
+    # deprecated, used to be loop and loop_args but loop has been repurposed
     loop_with = NonInheritableFieldAttribute(isa='string', private=True)
 
     def __init__(self, block=None, role=None, task_include=None):
+        """ constructors a task, without the Task.load classmethod, it will be pretty blank """
         self._role = role
         self._parent = task_include if task_include else block
         self.implicit = False
@@ -73,15 +94,24 @@ class Task(Base, Conditional, Taggable, CollectionSearch, Notifiable, Delegatabl
         super(Task, self).__init__()
 
     def get_name(self, include_role_fqcn=True):
+        """ return the name of the task """
         role_name = self._role.get_name(include_role_fqcn=include_role_fqcn) if self._role else None
-        
         if self._role and self.name:
             return f"{role_name} : {self.name}"
-        if self.name:
+        elif self.name:
             return self.name
-        if self._role:
+        elif self._role:
             return f"{role_name} : {self.action}"
-        return str(self.action)
+        else:
+            return self.action
+
+    def _merge_kv(self, ds):
+        if ds is None:
+            return ""
+        if isinstance(ds, string_types):
+            return ds
+        if isinstance(ds, dict):
+            return " ".join(f"{k}={v}" for k, v in ds.items() if not k.startswith('_'))
 
     @staticmethod
     def load(data, block=None, role=None, task_include=None, variable_manager=None, loader=None):
@@ -89,35 +119,45 @@ class Task(Base, Conditional, Taggable, CollectionSearch, Notifiable, Delegatabl
         return t.load_data(data, variable_manager=variable_manager, loader=loader)
 
     def __repr__(self):
+        """ returns a human-readable representation of the task """
         if self.action in C._ACTION_META:
-            return "TASK: meta (%s)" % self.args['_raw_params']
+            return f"TASK: meta ({self.args['_raw_params']})"
         else:
-            return "TASK: %s" % self.get_name()
+            return f"TASK: {self.get_name()}"
 
     def _preprocess_with_loop(self, ds, new_ds, k, v):
+        """ take a lookup plugin name and store it correctly """
         loop_name = k.removeprefix("with_")
         if new_ds.get('loop') is not None or new_ds.get('loop_with') is not None:
-            raise AnsibleError("duplicate loop in task: %s" % loop_name, obj=ds)
+            raise AnsibleError(f"duplicate loop in task: {loop_name}", obj=ds)
         if v is None:
-            raise AnsibleError("you must specify a value when using %s" % k, obj=ds)
+            raise AnsibleError(f"you must specify a value when using {k}", obj=ds)
         new_ds['loop_with'] = loop_name
         new_ds['loop'] = v
 
     def preprocess_data(self, ds):
+        """
+        tasks are especially complex arguments so need pre-processing.
+        keep it short.
+        """
         if not isinstance(ds, dict):
-            raise AnsibleAssertionError('ds (%s) should be a dict but was a %s' % (ds, type(ds)))
+            raise AnsibleAssertionError(f'ds ({ds}) should be a dict but was a {type(ds)}')
 
         new_ds = AnsibleMapping()
         if isinstance(ds, AnsibleBaseYAMLObject):
             new_ds.ansible_pos = ds.ansible_pos
 
         collections_list = ds.get('collections', self.collections)
-        default_collection = AnsibleCollectionConfig.default_collection
+        collections_list = self.get_validated_value('collections', self.fattributes.get('collections'), collections_list, None) if collections_list else None
 
-        if default_collection and not self._role:
-            collections_list = [default_collection] + (collections_list or [])
+        if AnsibleCollectionConfig.default_collection and not self._role:
+            if collections_list:
+                if AnsibleCollectionConfig.default_collection not in collections_list:
+                    collections_list.insert(0, AnsibleCollectionConfig.default_collection)
+            else:
+                collections_list = [AnsibleCollectionConfig.default_collection]
 
-        if collections_list and not any(c in collections_list for c in ('ansible.builtin', 'ansible.legacy')):
+        if collections_list and 'ansible.builtin' not in collections_list and 'ansible.legacy' not in collections_list:
             collections_list.append('ansible.legacy')
 
         if collections_list:
@@ -127,21 +167,18 @@ class Task(Base, Conditional, Taggable, CollectionSearch, Notifiable, Delegatabl
         try:
             action, args, delegate_to = args_parser.parse()
         except AnsibleParserError as e:
-            raise AnsibleParserError(to_native(e), obj=ds, orig_exc=e) if not e.obj else e
-
-        self.resolved_action = args_parser.resolved_action
+            if e.obj:
+                raise
+            raise AnsibleParserError(to_native(e), obj=ds, orig_exc=e)
+        else:
+            self.resolved_action = args_parser.resolved_action
 
         if action in C._ACTION_HAS_CMD and 'cmd' in args:
-            if args.get('_raw_params', ''):
-                raise AnsibleError("The 'cmd' argument cannot be used when other raw parameters are specified.", obj=ds)
+            if args.get('_raw_params', '') != '':
+                raise AnsibleError("The 'cmd' argument cannot be used when other raw parameters are specified. Please put everything in one or the other place.", obj=ds)
             args['_raw_params'] = args.pop('cmd')
 
-        new_ds.update({
-            'action': action,
-            'args': args,
-            'delegate_to': delegate_to,
-            'vars': self._load_vars(None, ds.get('vars', {}))
-        })
+        new_ds.update({'action': action, 'args': args, 'delegate_to': delegate_to, 'vars': self._load_vars(None, ds.get('vars', {}))})
 
         for k, v in ds.items():
             if k in ('action', 'local_action', 'args', 'delegate_to') or k == action or k == 'shell':
@@ -151,18 +188,13 @@ class Task(Base, Conditional, Taggable, CollectionSearch, Notifiable, Delegatabl
             elif C.INVALID_TASK_ATTRIBUTE_FAILED or k in self.fattributes:
                 new_ds[k] = v
             else:
-                display.warning("Ignoring invalid attribute: %s" % k)
+                display.warning(f"Ignoring invalid attribute: {k}")
 
         return super(Task, self).preprocess_data(new_ds)
 
     def _load_loop_control(self, attr, ds):
         if not isinstance(ds, dict):
-            raise AnsibleParserError(
-                "the `loop_control` value must be specified as a dictionary and cannot "
-                "be a variable itself (though it can contain variables)",
-                obj=ds,
-            )
-
+            raise AnsibleParserError("the `loop_control` value must be specified as a dictionary and cannot be a variable itself (though it can contain variables)", obj=ds)
         return LoopControl.load(data=ds, variable_manager=self._variable_manager, loader=self._loader)
 
     def _validate_attributes(self, ds):
@@ -185,21 +217,28 @@ class Task(Base, Conditional, Taggable, CollectionSearch, Notifiable, Delegatabl
             raise AnsibleParserError(f"Invalid variable name in 'register' specified: '{value}'")
 
     def post_validate(self, templar):
+        """
+        Override of base class post_validate, to also do final validation on
+        the block and task include (if any) to which this task belongs.
+        """
         if self._parent:
             self._parent.post_validate(templar)
-
-        if AnsibleCollectionConfig.default_collection:
-            pass
-
         super(Task, self).post_validate(templar)
 
     def _post_validate_loop(self, attr, value, templar):
+        """
+        Override post validation for the loop field, which is templated
+        specially in the TaskExecutor class when evaluating loops.
+        """
         return value
 
     def _post_validate_environment(self, attr, value, templar):
+        """
+        Override post validation of vars on the play, as we don't want to
+        template these too early.
+        """
         env = {}
         if value is not None:
-
             def _parse_env_kv(k, v):
                 try:
                     env[k] = templar.template(v, convert_bare=False)
@@ -217,12 +256,11 @@ class Task(Base, Conditional, Taggable, CollectionSearch, Notifiable, Delegatabl
                     else:
                         isdict = templar.template(env_item, convert_bare=False)
                         if isinstance(isdict, dict):
-                            env |= isdict
+                            env.update(isdict)
                         else:
-                            display.warning("could not parse environment value, skipping: %s" % value)
+                            display.warning(f"could not parse environment value, skipping: {value}")
 
             elif isinstance(value, dict):
-                env = dict()
                 for env_item in value:
                     _parse_env_kv(env_item, value[env_item])
             else:
@@ -231,67 +269,56 @@ class Task(Base, Conditional, Taggable, CollectionSearch, Notifiable, Delegatabl
         return env
 
     def _post_validate_changed_when(self, attr, value, templar):
+        """
+        changed_when is evaluated after the execution of the task is complete,
+        and should not be templated during the regular post_validate step.
+        """
         return value
 
     def _post_validate_failed_when(self, attr, value, templar):
+        """
+        failed_when is evaluated after the execution of the task is complete,
+        and should not be templated during the regular post_validate step.
+        """
         return value
 
     def _post_validate_until(self, attr, value, templar):
+        """
+        until is evaluated after the execution of the task is complete,
+        and should not be templated during the regular post_validate step.
+        """
         return value
 
     def get_vars(self):
-        all_vars = dict()
-        if self._parent:
-            all_vars |= self._parent.get_vars()
-
-        all_vars |= self.vars
-
-        if 'tags' in all_vars:
-            del all_vars['tags']
-        if 'when' in all_vars:
-            del all_vars['when']
-
+        all_vars = self._parent.get_vars() if self._parent else {}
+        all_vars.update(self.vars)
+        all_vars.pop('tags', None)
+        all_vars.pop('when', None)
         return all_vars
 
     def get_include_params(self):
-        all_vars = dict()
-        if self._parent:
-            all_vars |= self._parent.get_include_params()
+        all_vars = self._parent.get_include_params() if self._parent else {}
         if self.action in C._ACTION_ALL_INCLUDES:
-            all_vars |= self.vars
+            all_vars.update(self.vars)
         return all_vars
 
     def copy(self, exclude_parent=False, exclude_tasks=False):
         new_me = super(Task, self).copy()
-
-        new_me._parent = None
-        if self._parent and not exclude_parent:
-            new_me._parent = self._parent.copy(exclude_tasks=exclude_tasks)
-
-        new_me._role = None
-        if self._role:
-            new_me._role = self._role
-
+        new_me._parent = self._parent.copy(exclude_tasks=exclude_tasks) if self._parent and not exclude_parent else None
+        new_me._role = self._role
         new_me.implicit = self.implicit
         new_me.resolved_action = self.resolved_action
         new_me._uuid = self._uuid
-
         return new_me
 
     def serialize(self):
         data = super(Task, self).serialize()
-
         if not self._squashed and not self._finalized:
             if self._parent:
-                data['parent'] = self._parent.serialize()
-                data['parent_type'] = self._parent.__class__.__name__
-
+                data.update({'parent': self._parent.serialize(), 'parent_type': self._parent.__class__.__name__})
             if self._role:
                 data['role'] = self._role.serialize()
-
-            data['implicit'] = self.implicit
-            data['resolved_action'] = self.resolved_action
-
+            data.update({'implicit': self.implicit, 'resolved_action': self.resolved_action})
         return data
 
     def deserialize(self, data):
@@ -320,52 +347,40 @@ class Task(Base, Conditional, Taggable, CollectionSearch, Notifiable, Delegatabl
 
         self.implicit = data.get('implicit', False)
         self.resolved_action = data.get('resolved_action')
-
         super(Task, self).deserialize(data)
 
     def set_loader(self, loader):
+        """
+        Sets the loader on this object and recursively on parent, child objects.
+        This is used primarily after the Task has been serialized/deserialized, which
+        does not preserve the loader.
+        """
         self._loader = loader
-
         if self._parent:
             self._parent.set_loader(loader)
 
     def _get_parent_attribute(self, attr, omit=False):
+        """
+        Generic logic to get the attribute or parent attribute for a task value.
+        """
         fattr = self.fattributes[attr]
-
         extend = fattr.extend
         prepend = fattr.prepend
 
         try:
-            if omit:
-                value = Sentinel
-            else:
-                value = getattr(self, f'_{attr}', Sentinel)
-
-            if getattr(self._parent, 'statically_loaded', True):
-                _parent = self._parent
-            else:
-                _parent = self._parent._parent
+            value = Sentinel if omit else getattr(self, f'_{attr}', Sentinel)
+            _parent = self._parent if getattr(self._parent, 'statically_loaded', True) else self._parent._parent
 
             if _parent and (value is Sentinel or extend):
-                if getattr(_parent, 'statically_loaded', True):
-                    if attr != 'vars' and hasattr(_parent, '_get_parent_attribute'):
-                        parent_value = _parent._get_parent_attribute(attr)
-                    else:
-                        parent_value = getattr(_parent, f'_{attr}', Sentinel)
-
-                    if extend:
-                        value = self._extend_value(value, parent_value, prepend)
-                    else:
-                        value = parent_value
+                parent_value = _parent._get_parent_attribute(attr) if attr != 'vars' and hasattr(_parent, '_get_parent_attribute') else getattr(_parent, f'_{attr}', Sentinel)
+                value = self._extend_value(value, parent_value, prepend) if extend else parent_value
         except KeyError:
             pass
 
         return value
 
     def all_parents_static(self):
-        if self._parent:
-            return self._parent.all_parents_static()
-        return True
+        return self._parent.all_parents_static() if self._parent else True
 
     def get_first_parent_include(self):
         from ansible.playbook.task_include import TaskInclude
