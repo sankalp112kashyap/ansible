@@ -34,8 +34,6 @@ def load_list_of_blocks(ds, play, parent_block=None, role=None, task_include=Non
     return a list of Block() objects, where implicit blocks
     are created for each bare Task.
     """
-
-    # we import here to prevent a circular dependency with imports
     from ansible.playbook.block import Block
 
     if not isinstance(ds, (list, type(None))):
@@ -46,21 +44,16 @@ def load_list_of_blocks(ds, play, parent_block=None, role=None, task_include=Non
         count = iter(range(len(ds)))
         for i in count:
             block_ds = ds[i]
-            # Implicit blocks are created by bare tasks listed in a play without
-            # an explicit block statement. If we have two implicit blocks in a row,
-            # squash them down to a single block to save processing time later.
             implicit_blocks = []
             while block_ds is not None and not Block.is_block(block_ds):
                 implicit_blocks.append(block_ds)
                 i += 1
-                # Advance the iterator, so we don't repeat
                 next(count, None)
                 try:
                     block_ds = ds[i]
                 except IndexError:
                     block_ds = None
 
-            # Loop both implicit blocks and block_ds as block_ds is the next in the list
             for b in (implicit_blocks, block_ds):
                 if b:
                     block_list.append(
@@ -84,8 +77,6 @@ def load_list_of_tasks(ds, play, block=None, role=None, task_include=None, use_h
     Given a list of task datastructures (parsed from YAML),
     return a list of Task() or TaskInclude() objects.
     """
-
-    # we import here to prevent a circular dependency with imports
     from ansible.playbook.block import Block
     from ansible.playbook.handler import Handler
     from ansible.playbook.task import Task
@@ -121,20 +112,12 @@ def load_list_of_tasks(ds, play, block=None, role=None, task_include=None, use_h
             try:
                 (action, args, delegate_to) = args_parser.parse(skip_action_validation=True)
             except AnsibleParserError as e:
-                # if the raises exception was created with obj=ds args, then it includes the detail
-                # so we dont need to add it so we can just re raise.
                 if e.obj:
                     raise
-                # But if it wasn't, we can add the yaml object now to get more detail
                 raise AnsibleParserError(to_native(e), obj=task_ds, orig_exc=e)
 
             if action in C._ACTION_ALL_INCLUDE_IMPORT_TASKS:
-
-                if use_handlers:
-                    include_class = HandlerTaskInclude
-                else:
-                    include_class = TaskInclude
-
+                include_class = HandlerTaskInclude if use_handlers else TaskInclude
                 t = include_class.load(
                     task_ds,
                     block=block,
@@ -147,23 +130,16 @@ def load_list_of_tasks(ds, play, block=None, role=None, task_include=None, use_h
                 all_vars = variable_manager.get_vars(play=play, task=t)
                 templar = Templar(loader=loader, variables=all_vars)
 
-                # check to see if this include is dynamic or static:
                 if action in C._ACTION_IMPORT_TASKS:
                     if t.loop is not None:
                         raise AnsibleParserError("You cannot use loops on 'import_tasks' statements. You should use 'include_tasks' instead.", obj=task_ds)
 
-                    # we set a flag to indicate this include was static
                     t.statically_loaded = True
-
-                    # handle relative includes by walking up the list of parent include
-                    # tasks and checking the relative result to see if it exists
                     parent_include = block
                     cumulative_path = None
 
                     found = False
-                    subdir = 'tasks'
-                    if use_handlers:
-                        subdir = 'handlers'
+                    subdir = 'handlers' if use_handlers else 'tasks'
                     while parent_include is not None:
                         if not isinstance(parent_include, TaskInclude):
                             parent_include = parent_include._parent
@@ -222,10 +198,6 @@ def load_list_of_tasks(ds, play, block=None, role=None, task_include=None, use_h
                     elif not isinstance(data, list):
                         raise AnsibleParserError("included task files must contain a list of tasks", obj=data)
 
-                    # since we can't send callbacks here, we display a message directly in
-                    # the same fashion used by the on_include callback. We also do it here,
-                    # because the recursive nature of helper methods means we may be loading
-                    # nested includes, and we want the include order printed correctly
                     display.vv("statically imported: %s" % include_file)
 
                     ti_copy = t.copy(exclude_parent=True)
@@ -243,13 +215,9 @@ def load_list_of_tasks(ds, play, block=None, role=None, task_include=None, use_h
 
                     tags = ti_copy.tags[:]
 
-                    # now we extend the tags on each of the included blocks
                     for b in included_blocks:
                         b.tags = list(set(b.tags).union(tags))
-                    # END FIXME
 
-                    # FIXME: handlers shouldn't need this special handling, but do
-                    #        right now because they don't iterate blocks correctly
                     if use_handlers:
                         for b in included_blocks:
                             task_list.extend(b.block)
@@ -275,20 +243,15 @@ def load_list_of_tasks(ds, play, block=None, role=None, task_include=None, use_h
                     if ir.loop is not None:
                         raise AnsibleParserError("You cannot use loops on 'import_role' statements. You should use 'include_role' instead.", obj=task_ds)
 
-                    # we set a flag to indicate this include was static
                     ir.statically_loaded = True
-
-                    # template the role name now, if needed
                     all_vars = variable_manager.get_vars(play=play, task=ir)
                     templar = Templar(loader=loader, variables=all_vars)
                     ir.post_validate(templar=templar)
                     ir._role_name = templar.template(ir._role_name)
 
-                    # uses compiled list from object
                     blocks, dummy = ir.get_block_list(variable_manager=variable_manager, loader=loader)
                     task_list.extend(blocks)
                 else:
-                    # passes task object itself for latter generation of list
                     task_list.append(ir)
             else:
                 if use_handlers:
@@ -308,15 +271,7 @@ def load_list_of_tasks(ds, play, block=None, role=None, task_include=None, use_h
 def load_list_of_roles(ds, play, current_role_path=None, variable_manager=None, loader=None, collection_search_list=None):
     """
     Loads and returns a list of RoleInclude objects from the ds list of role definitions
-    :param ds: list of roles to load
-    :param play: calling Play object
-    :param current_role_path: path of the owning role, if any
-    :param variable_manager: varmgr to use for templating
-    :param loader: loader to use for DS parsing/services
-    :param collection_search_list: list of collections to search for unqualified role names
-    :return:
     """
-    # we import here to prevent a circular dependency with imports
     from ansible.playbook.role.include import RoleInclude
 
     if not isinstance(ds, list):
